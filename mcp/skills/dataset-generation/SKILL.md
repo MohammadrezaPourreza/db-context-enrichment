@@ -29,15 +29,32 @@ Your main goal is to convert a user's data into a standard format and then optio
 
 9.  **Expand Dataset (if requested)**: If the user says yes:
     a.  Read the current dataset file.
-    b.  **Generate Variations**: Generate new, diverse NL-SQL pairs. Be creative and think about how to vary the existing questions. Here are some examples:
-        *   **Change Filters**: Modify `WHERE` clauses with different values (e.g., if the original query is for 'USA', create a new one for 'Canada').
-        *   **Use Synonyms**: Rephrase the natural language question with synonyms (e.g., 'total revenue' vs. 'sum of sales').
-        *   **Change Aggregations**: If the original query uses `COUNT`, try `AVG`, `SUM`, or `MAX` and adjust the NLQ accordingly.
-        *   **Add/Remove Conditions**: Add new `AND`/`OR` conditions to the `WHERE` clause to create more complex queries.
-        *   **Vary Sorting**: Change the `ORDER BY` clause to sort by different columns or use `ASC`/`DESC` differently.
-    c.  Validate all newly generated SQL queries with `execute_sql`.
-    d.  Present validated variations for user review (accept, edit, reject).
-    e.  Append the user-approved variations to the dataset file.
+    b.  **Ask the user which dimensions to apply** (explain each dimension briefly — see descriptions below) and which levels to generate (default: all three — low, medium, high). Default is all five dimensions.
+    c.  **For each anchor in the dataset**, call the appropriate MCP tool(s) for every selected dimension × level combination. The five dimensions are:
+
+        *   **Lexical** *(SQL invariant)* — Rephrases the NL question without changing SQL logic or values.
+            Tool: `generate_lexical_variant(anchor_question, anchor_sql, level)`
+
+        *   **Structural** *(SQL changes)* — Varies logical complexity: decompose (low), nest as subquery (medium), or combine two anchors via JOIN/UNION (high).
+            Tool: `generate_structural_variant(anchor_question, anchor_sql, db_schema, level, second_anchor_json?)`
+            > For **high** level: select a second anchor from the same `database` field in the dataset and pass it as `second_anchor_json` (JSON: `{"question": "...", "sql": "..."}`).
+
+        *   **Interference** *(SQL invariant)* — Injects conversational noise the system must discard: politeness fillers (low), business backstory (medium), or red-herring schema distractors (high).
+            Tool: `generate_interference_variant(anchor_question, anchor_sql, db_schema, level)`
+
+        *   **Value** *(SQL structure preserved)* — Changes literal filter values: NL surface reword only (low), real-value substitution via DB lookup (medium), substitution + NL reword (high).
+            Tool: `generate_value_variant(anchor_question, anchor_sql, level, candidate_values_json?)`
+            > For **medium** and **high** levels: first run `execute_sql('SELECT DISTINCT <column> FROM <table>')` for each `WHERE`/`HAVING` column in the anchor SQL, then pass results as `candidate_values_json` (JSON: `{"table.column": ["val1", "val2", ...]}`).
+
+        *   **Schema Correction** *(SQL invariant)* — Introduces typos into schema terms in the question: case/space mutations (low), abbreviations (medium), character-level typos (high).
+            Tool: `generate_schema_correction_variant(anchor_question, anchor_sql, db_schema, level)`
+            > Schema terms are extracted automatically via LLM if not pre-supplied.
+
+    d.  **Generate & Judge**: After each tool call, apply a two-stage quality gate:
+        1.  *Execution validation*: run the `variant_sql` from the tool's response using `execute_sql`. Discard the variant if it errors or returns an empty result set.
+        2.  *LLM judge*: call `judge_variant(anchor_question, anchor_sql, variant_question, variant_sql, dimension, db_schema)`. Discard variants where `verdict` is `"fail"`.
+    e.  Present validated variations for user review (accept, edit, reject).
+    f.  Append the user-approved variations to the dataset file, including the `dimension` and `level` metadata fields.
 
 10. **Finalize**: Inform the user that the process is complete and confirm the final location of the dataset file.
 
@@ -47,6 +64,11 @@ The standard evaluation format is a JSON object:
     "id": "eval_001",
     "database": "db_sales",
     "nlq": "What is the total revenue for the top 5 products?",
-    "golden_sql": "SELECT product_id, sum(net_revenue) FROM sales GROUP BY product_id ORDER BY sum(net_revenue) DESC LIMIT 5;"
+    "golden_sql": "SELECT product_id, sum(net_revenue) FROM sales GROUP BY product_id ORDER BY sum(net_revenue) DESC LIMIT 5;",
+    "anchor_id": "eval_001",
+    "dimension": "lexical",
+    "level": "medium"
 }
 ```
+
+The `anchor_id` field references the seed entry this variant was generated from. For seed entries themselves, `anchor_id`, `dimension`, and `level` are set to `null`.

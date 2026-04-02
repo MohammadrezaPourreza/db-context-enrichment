@@ -11,6 +11,19 @@ import datetime
 import os
 import json
 from bootstrap import bootstrap_generator
+from dataset_generation import (
+    lexical as lexical_gen,
+    structural as structural_gen,
+    interference as interference_gen,
+    value_distance as value_gen,
+    schema_correction as schema_correction_gen,
+)
+from dataset_generation.base import (
+    set_generation_model,
+    set_lightweight_model,
+    llm_call,
+)
+from pydantic import BaseModel, Field
 
 mcp = FastMCP("DB Context Enrichment MCP")
 
@@ -312,6 +325,338 @@ def generate_upload_url(
             return "Error: Missing instance_id, database_id, or project_id for spanner."
     else:
         return "Error: Invalid db_type. Must be one of 'alloydb', 'cloudsql', or 'spanner'."
+
+
+# ─── Dataset expansion tools ─────────────────────────────────────────────────
+
+
+@mcp.tool
+def set_dataset_generation_model(
+    generation_model: str,
+    lightweight_model: str | None = None,
+) -> str:
+    """
+    Overrides the LLM models used by all dataset-generation dimension tools.
+
+    Args:
+        generation_model: Model name for creative generation and judging steps
+               (e.g. 'gemini-2.5-pro'). Default: 'gemini-2.5-pro'.
+        lightweight_model: Model name for cheap extraction steps such as value-slot
+               extraction and schema-term extraction (e.g. 'gemini-2.5-flash').
+               If omitted, the lightweight model is left unchanged.
+
+    Returns:
+        A confirmation message showing the active model names.
+    """
+    set_generation_model(generation_model)
+    if lightweight_model:
+        set_lightweight_model(lightweight_model)
+    from dataset_generation.base import get_generation_model, get_lightweight_model
+    return json.dumps({
+        "generation_model": get_generation_model(),
+        "lightweight_model": get_lightweight_model(),
+    })
+
+
+@mcp.tool
+async def generate_lexical_variant(
+    anchor_question: str,
+    anchor_sql: str,
+    level: str,
+) -> str:
+    """
+    Generates a Lexical Distance variant of a seed NL-SQL pair.
+    Rephrases the natural language question without altering SQL logic or data values.
+    The variant SQL is always identical to the anchor SQL.
+
+    Args:
+        anchor_question: The original natural language question.
+        anchor_sql: The original SQL query.
+        level: Transformation severity — 'low' (syntactic paraphrase),
+               'medium' (domain-jargon substitution), or 'high' (slang/idiomatic).
+
+    Returns:
+        A JSON string representing a NoiseVariant object.
+    """
+    try:
+        variant_question, variant_sql = await lexical_gen.generate_lexical_variant(
+            anchor_question, anchor_sql, level
+        )
+        return context.NoiseVariant(
+            anchor_question=anchor_question,
+            anchor_sql=anchor_sql,
+            dimension="lexical",
+            level=level.lower(),
+            variant_question=variant_question,
+            variant_sql=variant_sql,
+        ).model_dump_json(indent=2)
+    except (ValueError, Exception) as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool
+async def generate_structural_variant(
+    anchor_question: str,
+    anchor_sql: str,
+    db_schema: str,
+    level: str,
+    second_anchor_json: str | None = None,
+) -> str:
+    """
+    Generates a Structural Distance variant of a seed NL-SQL pair.
+    Varies the logical complexity of the request; the SQL changes at every level.
+
+    Args:
+        anchor_question: The original natural language question.
+        anchor_sql: The original SQL query.
+        db_schema: The database schema DDL.
+        level: Transformation severity — 'low' (decompose: simplest sub-part),
+               'medium' (nest: anchor becomes subquery),
+               'high' (combine: merge two anchors from the same DB).
+        second_anchor_json: Required for 'high' level. JSON string with keys
+               'question' and 'sql' for a second anchor from the same database.
+               Example: '{"question": "...", "sql": "..."}'
+
+    Returns:
+        A JSON string representing a NoiseVariant object.
+    """
+    try:
+        variant_question, variant_sql = await structural_gen.generate_structural_variant(
+            anchor_question, anchor_sql, db_schema, level, second_anchor_json
+        )
+        return context.NoiseVariant(
+            anchor_question=anchor_question,
+            anchor_sql=anchor_sql,
+            dimension="structural",
+            level=level.lower(),
+            variant_question=variant_question,
+            variant_sql=variant_sql,
+        ).model_dump_json(indent=2)
+    except (ValueError, Exception) as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool
+async def generate_interference_variant(
+    anchor_question: str,
+    anchor_sql: str,
+    db_schema: str,
+    level: str,
+) -> str:
+    """
+    Generates an Interference Distance variant of a seed NL-SQL pair.
+    Injects conversational noise that the NL2SQL system must identify and discard;
+    the core analytical intent and the SQL remain unchanged.
+
+    Args:
+        anchor_question: The original natural language question.
+        anchor_sql: The original SQL query.
+        db_schema: The database schema DDL.
+        level: Noise severity — 'low' (politeness fillers),
+               'medium' (business-context backstory),
+               'high' (red-herring schema distractors).
+
+    Returns:
+        A JSON string representing a NoiseVariant object.
+    """
+    try:
+        variant_question, variant_sql = await interference_gen.generate_interference_variant(
+            anchor_question, anchor_sql, db_schema, level
+        )
+        return context.NoiseVariant(
+            anchor_question=anchor_question,
+            anchor_sql=anchor_sql,
+            dimension="interference",
+            level=level.lower(),
+            variant_question=variant_question,
+            variant_sql=variant_sql,
+        ).model_dump_json(indent=2)
+    except (ValueError, Exception) as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool
+async def generate_value_variant(
+    anchor_question: str,
+    anchor_sql: str,
+    level: str,
+    candidate_values_json: str | None = None,
+) -> str:
+    """
+    Generates a Value Distance variant of a seed NL-SQL pair.
+    Preserves the SQL structure but changes WHERE/HAVING literals and
+    (optionally) their NL surface forms.
+
+    For 'medium' and 'high' levels, you must first fetch candidate values by
+    running  SELECT DISTINCT <column> FROM <table>  for each relevant column
+    using the execute_sql tool, then pass the results via candidate_values_json.
+
+    Args:
+        anchor_question: The original natural language question.
+        anchor_sql: The original SQL query.
+        level: Substitution severity — 'low' (surface NL reword, SQL identical),
+               'medium' (full literal substitution with real DB values),
+               'high' (full substitution + surface NL reword).
+        candidate_values_json: Required for 'medium'/'high'. JSON mapping
+               "table.column" → list of real DB values. Example:
+               '{"loans.duration": ["12","24","36","60"]}'
+
+    Returns:
+        A JSON string representing a NoiseVariant object.
+    """
+    try:
+        variant_question, variant_sql = await value_gen.generate_value_variant(
+            anchor_question, anchor_sql, level, candidate_values_json
+        )
+        return context.NoiseVariant(
+            anchor_question=anchor_question,
+            anchor_sql=anchor_sql,
+            dimension="value",
+            level=level.lower(),
+            variant_question=variant_question,
+            variant_sql=variant_sql,
+        ).model_dump_json(indent=2)
+    except (ValueError, Exception) as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool
+async def generate_schema_correction_variant(
+    anchor_question: str,
+    anchor_sql: str,
+    db_schema: str,
+    level: str,
+    schema_terms_json: str | None = None,
+) -> str:
+    """
+    Generates a Schema Correction Distance variant of a seed NL-SQL pair.
+    Introduces typos or fuzzy references to schema terms in the question;
+    the SQL remains identical to the anchor.
+
+    Args:
+        anchor_question: The original natural language question.
+        anchor_sql: The original SQL query.
+        db_schema: The database schema DDL (used to extract schema terms if
+               schema_terms_json is not provided).
+        level: Mutation severity — 'low' (case changes + inserted spaces),
+               'medium' (abbreviation substitution), 'high' (character-level typos).
+        schema_terms_json: Optional pre-extracted schema term list as a JSON array
+               of {"schema_term", "question_token", "term_type"} objects. If omitted
+               the tool extracts them automatically via an LLM call.
+
+    Returns:
+        A JSON string representing a NoiseVariant object.
+    """
+    try:
+        variant_question, variant_sql = await schema_correction_gen.generate_schema_correction_variant(
+            anchor_question, anchor_sql, db_schema, level, schema_terms_json
+        )
+        return context.NoiseVariant(
+            anchor_question=anchor_question,
+            anchor_sql=anchor_sql,
+            dimension="schema_correction",
+            level=level.lower(),
+            variant_question=variant_question,
+            variant_sql=variant_sql,
+        ).model_dump_json(indent=2)
+    except (ValueError, Exception) as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool
+async def judge_variant(
+    anchor_question: str,
+    anchor_sql: str,
+    variant_question: str,
+    variant_sql: str,
+    dimension: str,
+    db_schema: str,
+) -> str:
+    """
+    Applies an LLM judge to a generated variant, enforcing universal quality rules
+    and per-dimension correctness constraints.
+
+    Call this after execute_sql has confirmed the variant SQL runs without errors
+    and returns a non-empty result set.
+
+    Args:
+        anchor_question: The original NL question.
+        anchor_sql: The original SQL query.
+        variant_question: The generated variant NL question.
+        variant_sql: The generated variant SQL.
+        dimension: One of: lexical | structural | interference | value | schema_correction.
+        db_schema: The database schema DDL.
+
+    Returns:
+        A JSON string with keys "verdict" ('pass' or 'fail') and "reason"
+        (one-sentence justification).
+    """
+    _DIMENSION_RULES = {
+        "lexical": (
+            "- The variant SQL must be identical to the anchor SQL.\n"
+            "- No new filtering conditions may have been introduced by the rewrite."
+        ),
+        "structural": (
+            "- The variant SQL must be structurally different from the anchor SQL.\n"
+            "- The structural change must be plausible (decompose, nest, or combine)."
+        ),
+        "interference": (
+            "- The variant SQL must be identical to the anchor SQL.\n"
+            "- The core analytical intent must be recoverable from the variant question.\n"
+            "- No new filter constraints may have been introduced by the noise."
+        ),
+        "value": (
+            "- The SQL structure (joins, aggregations, column references) must be preserved.\n"
+            "- Only WHERE/HAVING literals may differ between anchor and variant SQL."
+        ),
+        "schema_correction": (
+            "- The variant SQL must be identical to the anchor SQL.\n"
+            "- The mutated schema terms in the variant question must still unambiguously"
+            " map to the correct schema entities."
+        ),
+    }
+
+    class _JudgeResponse(BaseModel):
+        verdict: str = Field(..., description="'pass' or 'fail'")
+        reason: str = Field(..., description="One-sentence justification.")
+
+    dimension_key = dimension.lower()
+    dim_rules = _DIMENSION_RULES.get(
+        dimension_key,
+        "- Verify the variant is a plausible and high-quality transformation of the anchor.",
+    )
+
+    prompt = textwrap.dedent(f"""\
+        You are an expert NL2SQL dataset quality judge.
+
+        DATABASE SCHEMA:
+        {db_schema}
+
+        ANCHOR QUESTION: {anchor_question}
+        ANCHOR SQL:      {anchor_sql}
+
+        VARIANT QUESTION: {variant_question}
+        VARIANT SQL:      {variant_sql}
+
+        DIMENSION: {dimension}
+
+        UNIVERSAL RULES (must ALL hold for a 'pass'):
+        - The variant question is grammatically correct and unambiguous.
+        - The variant SQL is valid SQL and correctly answers the variant question.
+        - The variant has exactly one correct SQL interpretation.
+
+        DIMENSION-SPECIFIC RULES:
+        {dim_rules}
+
+        Respond with a JSON object with keys "verdict" ('pass' or 'fail') and
+        "reason" (one sentence explaining your decision).
+    """)
+
+    try:
+        result = await llm_call(prompt, _JudgeResponse)
+        return result.model_dump_json(indent=2)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
 
 
 @mcp.prompt

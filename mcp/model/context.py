@@ -69,6 +69,22 @@ class ValueSearch(BaseModel):
     )
     description: str | None = Field(None, description="Optional description.")
 
+class NoiseVariant(BaseModel):
+    """A variant of a seed NL-SQL pair generated along one dimension of distance."""
+
+    anchor_question: str = Field(..., description="The original NL question this was derived from.")
+    anchor_sql: str = Field(..., description="The original SQL this was derived from.")
+    dimension: str = Field(
+        ...,
+        description="Generation dimension: lexical | structural | interference | value | schema_correction",
+    )
+    level: str = Field(..., description="Distance level: low | medium | high")
+    variant_question: str = Field(..., description="The variant natural language question.")
+    variant_sql: str = Field(..., description="The ground-truth SQL for the variant question.")
+    judge_verdict: str | None = Field(None, description="LLM judge verdict: pass | fail")
+    judge_reason: str | None = Field(None, description="One-sentence justification from the judge.")
+
+
 class ContextSet(BaseModel):
     """A set of templates, facets and value searches."""
 
