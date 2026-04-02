@@ -1,5 +1,6 @@
 from fastmcp import FastMCP
 from typing import List
+import asyncio
 import textwrap
 from template import question_generator, template_generator
 from facet import facet_generator
@@ -655,6 +656,181 @@ async def judge_variant(
     try:
         result = await llm_call(prompt, _JudgeResponse)
         return result.model_dump_json(indent=2)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+# ── Internal dispatcher (not an MCP tool) ────────────────────────────────────
+
+async def _dispatch_variant(req: dict) -> str:
+    """Route a single generation request dict to the appropriate generator."""
+    dimension = req.get("dimension", "").lower()
+    anchor_question = req["anchor_question"]
+    anchor_sql = req["anchor_sql"]
+    level = req.get("level", "medium")
+
+    try:
+        if dimension == "lexical":
+            vq, vs = await lexical_gen.generate_lexical_variant(
+                anchor_question, anchor_sql, level
+            )
+        elif dimension == "structural":
+            vq, vs = await structural_gen.generate_structural_variant(
+                anchor_question, anchor_sql,
+                req.get("db_schema", ""),
+                level,
+                req.get("second_anchor_json"),
+            )
+        elif dimension == "interference":
+            vq, vs = await interference_gen.generate_interference_variant(
+                anchor_question, anchor_sql,
+                req.get("db_schema", ""),
+                level,
+            )
+        elif dimension == "value":
+            vq, vs = await value_gen.generate_value_variant(
+                anchor_question, anchor_sql,
+                level,
+                req.get("candidate_values_json"),
+            )
+        elif dimension == "schema_correction":
+            vq, vs = await schema_correction_gen.generate_schema_correction_variant(
+                anchor_question, anchor_sql,
+                req.get("db_schema", ""),
+                level,
+                req.get("schema_terms_json"),
+            )
+        else:
+            return json.dumps({"error": f"Unknown dimension: '{dimension}'"})
+
+        return context.NoiseVariant(
+            anchor_question=anchor_question,
+            anchor_sql=anchor_sql,
+            dimension=dimension,
+            level=level,
+            variant_question=vq,
+            variant_sql=vs,
+        ).model_dump_json()
+    except Exception as e:
+        return json.dumps({"error": str(e), "dimension": dimension, "level": level})
+
+
+@mcp.tool
+async def generate_variants_batch(requests_json: str) -> str:
+    """
+    Generates multiple NL-SQL variants concurrently in a single call.
+
+    All generation requests are dispatched simultaneously via asyncio.gather,
+    making this dramatically faster than calling the individual generate_*_variant
+    tools one by one. Use this whenever you need to generate variants for more
+    than one (anchor, dimension, level) combination.
+
+    Args:
+        requests_json: A JSON array of request objects. Each object must have:
+            - anchor_question (str): The original NL question.
+            - anchor_sql      (str): The original SQL query.
+            - dimension       (str): One of: lexical | structural | interference
+                                     | value | schema_correction.
+            - level           (str): One of: low | medium | high.
+          Optional per-dimension fields:
+            - db_schema            (str): Required for structural, interference,
+                                          and schema_correction dimensions.
+            - second_anchor_json   (str): Required for structural HIGH level.
+                                          JSON: '{"question": "...", "sql": "..."}'
+            - candidate_values_json (str): Required for value MEDIUM/HIGH.
+                                          JSON: '{"table.col": ["v1","v2",...]}'
+            - schema_terms_json    (str): Optional for schema_correction
+                                          (extracted automatically if omitted).
+
+        Example:
+            '[
+              {"anchor_question": "...", "anchor_sql": "...", "dimension": "lexical",    "level": "low"},
+              {"anchor_question": "...", "anchor_sql": "...", "dimension": "lexical",    "level": "medium"},
+              {"anchor_question": "...", "anchor_sql": "...", "dimension": "interference","level": "high","db_schema":"..."}
+            ]'
+
+    Returns:
+        A JSON array of results in the same order as the input requests.
+        Each result is either a NoiseVariant JSON object or {"error": "...", "dimension": "...", "level": "..."}.
+    """
+    try:
+        requests = json.loads(requests_json)
+        if not isinstance(requests, list):
+            return json.dumps({"error": "requests_json must be a JSON array."})
+
+        raw_results = await asyncio.gather(
+            *[_dispatch_variant(req) for req in requests],
+            return_exceptions=True,
+        )
+
+        output = []
+        for r in raw_results:
+            if isinstance(r, Exception):
+                output.append({"error": str(r)})
+            else:
+                output.append(json.loads(r))
+
+        return json.dumps(output, indent=2)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+@mcp.tool
+async def append_to_dataset_file(file_path: str, entries_json: str) -> str:
+    """
+    Appends one or more NL-SQL dataset entries to a JSON file.
+
+    Creates the file (as an empty JSON array) if it does not yet exist.
+    Entries are appended to the existing array and the file is overwritten atomically
+    (write to a temp file then rename) to avoid data loss on failure.
+
+    Args:
+        file_path:   Absolute path to the target dataset JSON file.
+        entries_json: A JSON array string of entry objects to append.
+                      Each entry should be a NoiseVariant JSON object or a
+                      standard seed entry (id, database, nlq, golden_sql, …).
+                      A single object (not wrapped in an array) is also accepted.
+
+    Returns:
+        A JSON object with:
+            - "appended": number of entries added in this call.
+            - "total":    new total number of entries in the file.
+            - "file":     the resolved file path.
+    """
+    try:
+        new_entries = json.loads(entries_json)
+        if isinstance(new_entries, dict):
+            new_entries = [new_entries]
+        if not isinstance(new_entries, list):
+            return json.dumps({"error": "entries_json must be a JSON object or array."})
+
+        if os.path.exists(file_path):
+            with open(file_path, "r", encoding="utf-8") as f:
+                existing = json.load(f)
+            if not isinstance(existing, list):
+                return json.dumps({"error": "Existing file does not contain a JSON array."})
+        else:
+            existing = []
+
+        existing.extend(new_entries)
+
+        # Write atomically: temp file in same directory, then rename
+        dir_name = os.path.dirname(os.path.abspath(file_path)) or "."
+        import tempfile
+        fd, tmp_path = tempfile.mkstemp(dir=dir_name, suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(existing, f, indent=2, ensure_ascii=False)
+            os.replace(tmp_path, file_path)
+        except Exception:
+            os.unlink(tmp_path)
+            raise
+
+        return json.dumps({
+            "appended": len(new_entries),
+            "total": len(existing),
+            "file": os.path.abspath(file_path),
+        })
     except Exception as e:
         return json.dumps({"error": str(e)})
 
