@@ -29,7 +29,7 @@ Your main goal is to convert a user's data into a standard format and then optio
 
 9.  **Expand Dataset (if requested)**: If the user says yes:
     a.  Read the current dataset file.
-    b.  **Ask the user which dimensions to apply** (explain each dimension briefly — see descriptions below) and which levels to generate (default: all three — low, medium, high). Default is all five dimensions.
+    b.  **Ask the user which dimensions to apply** (explain each dimension briefly — see descriptions below), which levels to generate (default: all three — low, medium, high), and **whether to enable the LLM judge step** (explain that it runs `judge_variant` after each successful SQL execution to filter semantically invalid variants — recommended but slower). Default is all five dimensions with LLM judging enabled.
     c.  **For each anchor in the dataset**, call the appropriate MCP tool(s) for every selected dimension × level combination. The five dimensions are:
 
         *   **Lexical** *(SQL invariant)* — Rephrases the NL question without changing SQL logic or values.
@@ -50,9 +50,9 @@ Your main goal is to convert a user's data into a standard format and then optio
             Tool: `generate_schema_correction_variant(anchor_question, anchor_sql, db_schema, level)`
             > Schema terms are extracted automatically via LLM if not pre-supplied.
 
-    d.  **Generate & Judge**: After each tool call, apply a two-stage quality gate:
-        1.  *Execution validation*: run the `variant_sql` from the tool's response using `execute_sql`. Discard the variant if it errors or returns an empty result set.
-        2.  *LLM judge*: call `judge_variant(anchor_question, anchor_sql, variant_question, variant_sql, dimension, db_schema)`. Discard variants where `verdict` is `"fail"`.
+    d.  **Generate & Validate**: After each tool call, apply the following quality gate:
+        1.  *Execution validation* (always): run the `variant_sql` from the tool's response using `execute_sql`. Discard the variant if it errors or returns an empty result set.
+        2.  *LLM judge* (only if the user opted in): call `judge_variant(anchor_question, anchor_sql, variant_question, variant_sql, dimension, db_schema)`. Discard variants where `verdict` is `"fail"`.
     e.  Present validated variations for user review (accept, edit, reject).
     f.  Append the user-approved variations to the dataset file, including the `dimension` and `level` metadata fields.
 
