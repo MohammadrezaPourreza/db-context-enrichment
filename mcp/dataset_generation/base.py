@@ -24,9 +24,8 @@ from google import genai
 
 # ── Module-level model names (override via set_* functions) ──────────────────
 
-_GENERATION_MODEL: str = "gemini-3-flash-preview"
-_LIGHTWEIGHT_MODEL: str = "gemini-3.1-flash-lite-preview"
-
+_GENERATION_MODEL: str = "gemini-2.5-pro"
+_LIGHTWEIGHT_MODEL: str = "gemini-2.5-flash"
 
 def set_generation_model(model_name: str) -> None:
     """Set the model used for all creative generation and judging steps."""
