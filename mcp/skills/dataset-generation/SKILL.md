@@ -29,38 +29,42 @@ Your main goal is to convert a user's data into a standard format and then optio
 
 9.  **Expand Dataset (if requested)**: If the user says yes:
     a.  Read the current dataset file.
-    b.  **Ask the user which dimensions to apply** (explain each dimension briefly — see descriptions below), which levels to generate (default: all three — low, medium, high), and **whether to enable the LLM judge step** (explain that it runs `judge_variant` after each successful SQL execution to filter semantically invalid variants — recommended but slower). Default is all five dimensions with LLM judging enabled.
-    c.  **Pre-fetch any required inputs** for the selected dimensions/levels before generating:
-        *   For **value** MEDIUM/HIGH: run `execute_sql('SELECT DISTINCT <column> FROM <table>')` for every `WHERE`/`HAVING` column in every anchor SQL and build one `candidate_values_json` map (`{"table.column": ["v1","v2",...]}`) per anchor.
-        *   For **structural** HIGH: identify a second anchor from the same `database` field in the dataset.
-    d.  **Generate all variants in one batch call** using `generate_variants_batch(requests_json)`.
-        Build a single JSON array containing *every* (anchor × dimension × level) combination the user selected, including all required optional fields (`db_schema`, `second_anchor_json`, `candidate_values_json`, `schema_terms_json`), and pass it in one call. All requests are executed concurrently — this is much faster than calling the individual tools one by one.
+    b.  **Ask the user all of the following before starting** (present as a single message):
+        1.  *How many anchors to expand?* — all of them, first N, or a random sample of N.
+        2.  *Which dimensions?* — briefly explain each (see descriptions below); default is all five.
+        3.  *Which levels?* — low / medium / high; default is all three.
+        4.  *Enable LLM judge?* — explain it runs `judge_variant` after each successful SQL execution to catch semantically incorrect variants (recommended but slower); default is enabled.
+    c.  **Select anchors** from the dataset according to the user's answer (slice, random sample, or use all).
+    d.  **Pre-fetch any required inputs** for the selected dimensions/levels before generating:
+        *   For **value** MEDIUM/HIGH: run `execute_sql('SELECT DISTINCT <column> FROM <table>')` for every `WHERE`/`HAVING` column in the selected anchor SQLs and build one `candidate_values_json` map (`{"table.column": ["v1","v2",...]}`) per anchor.
+        *   For **structural** HIGH: identify a second anchor from the same `database` field in the dataset. **Choose the second anchor by similarity** — prefer pairs whose SQL queries share at least one table or column reference, as this makes the combined JOIN/UNION query semantically coherent. Scan the other anchors for the same database, compare their `FROM`/`JOIN` clauses and column names against the current anchor's SQL, and pick the best match. If no overlapping anchor exists, choose the one whose NL question is most topically related.
+    e.  **For each selected anchor**, call **`expand_anchor`** once — it generates all requested dimension × level combinations concurrently in a single tool call, so there is no need to build a JSON array manually:
 
-        The five dimensions and their per-request fields:
+        ```
+        expand_anchor(
+            anchor_question       = <anchor.nlq>,
+            anchor_sql            = <anchor.golden_sql>,
+            dimensions            = <selected_dimensions>,    # e.g. ["lexical", "interference"]
+            levels                = <selected_levels>,        # e.g. ["low", "medium", "high"]
+            db_schema             = <schema_from_list_schemas>,
+            second_anchor_json    = '{"question": "...", "sql": "..."}',  # structural HIGH only
+            candidate_values_json = '{"table.col": ["v1", "v2"]}',        # value MEDIUM/HIGH only
+        )
+        ```
+
+        The five dimensions and what each does:
 
         *   **Lexical** *(SQL invariant)* — Rephrases the NL question without changing SQL logic or values.
-            Required fields: `anchor_question`, `anchor_sql`, `dimension: "lexical"`, `level`
+        *   **Structural** *(SQL changes)* — decompose (low), nest as subquery (medium), combine two anchors via JOIN/UNION (high). Requires `db_schema`; for **high** also pass `second_anchor_json`.
+        *   **Interference** *(SQL invariant)* — Injects noise the system must discard: fillers (low), business backstory (medium), red-herring schema distractors (high). Requires `db_schema`.
+        *   **Value** *(SQL structure preserved)* — Changes filter literals: NL surface reword only (low), real-value substitution (medium), substitution + NL reword (high). For medium/high pass `candidate_values_json` (pre-fetched in step d).
+        *   **Schema Correction** *(SQL invariant)* — Typos in schema terms: case/space (low), abbreviations (medium), char-level typos (high). Requires `db_schema`; schema terms extracted automatically.
 
-        *   **Structural** *(SQL changes)* — Varies logical complexity: decompose (low), nest as subquery (medium), or combine two anchors via JOIN/UNION (high).
-            Required fields: `anchor_question`, `anchor_sql`, `db_schema`, `dimension: "structural"`, `level`
-            > For **high** level: also include `second_anchor_json` (JSON: `{"question": "...", "sql": "..."}`).
-
-        *   **Interference** *(SQL invariant)* — Injects conversational noise the system must discard: politeness fillers (low), business backstory (medium), or red-herring schema distractors (high).
-            Required fields: `anchor_question`, `anchor_sql`, `db_schema`, `dimension: "interference"`, `level`
-
-        *   **Value** *(SQL structure preserved)* — Changes literal filter values: NL surface reword only (low), real-value substitution via DB lookup (medium), substitution + NL reword (high).
-            Required fields: `anchor_question`, `anchor_sql`, `dimension: "value"`, `level`
-            > For **medium** and **high** levels: also include `candidate_values_json` (pre-fetched in step c).
-
-        *   **Schema Correction** *(SQL invariant)* — Introduces typos into schema terms in the question: case/space mutations (low), abbreviations (medium), character-level typos (high).
-            Required fields: `anchor_question`, `anchor_sql`, `db_schema`, `dimension: "schema_correction"`, `level`
-            > `schema_terms_json` is optional — extracted automatically via LLM if omitted.
-
-    e.  **Validate & Judge**: For each variant returned by the batch call:
+    f.  **Validate each result** from `expand_anchor`'s output array:
         1.  *Execution validation* (always): run `variant_sql` via `execute_sql`. Discard the variant if it errors or returns an empty result set.
         2.  *LLM judge* (only if the user opted in): call `judge_variant(anchor_question, anchor_sql, variant_question, variant_sql, dimension, db_schema)`. Discard variants where `verdict` is `"fail"`.
-    f.  Present validated variations for user review (accept, edit, reject).
-    g.  Append the user-approved variations to the dataset file using `append_to_dataset_file(file_path, entries_json)`, including the `dimension` and `level` metadata fields.
+    g.  Present validated variants to the user for review (accept, edit, reject).
+    h.  Call **`append_to_dataset_file(file_path, entries_json)`** with all user-approved variants to persist them atomically.
 
 10. **Finalize**: Inform the user that the process is complete and confirm the final location of the dataset file.
 

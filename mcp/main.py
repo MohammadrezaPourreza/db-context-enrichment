@@ -835,6 +835,81 @@ async def append_to_dataset_file(file_path: str, entries_json: str) -> str:
         return json.dumps({"error": str(e)})
 
 
+@mcp.tool
+async def expand_anchor(
+    anchor_question: str,
+    anchor_sql: str,
+    dimensions: list[str],
+    levels: list[str],
+    db_schema: str = "",
+    second_anchor_json: str | None = None,
+    candidate_values_json: str | None = None,
+    schema_terms_json: str | None = None,
+) -> str:
+    """
+    Expands a single NL-SQL anchor across every requested dimension × level combination
+    in one concurrent call — no JSON request-array construction needed.
+
+    All generation tasks are dispatched simultaneously via asyncio.gather, making this
+    the preferred (fastest) way to expand an anchor. Call once per anchor instead of
+    calling individual generate_*_variant tools in a loop.
+
+    Args:
+        anchor_question: The original natural language question.
+        anchor_sql:      The original SQL query.
+        dimensions:      List of dimensions to generate. Any subset of:
+                         ["lexical", "structural", "interference", "value", "schema_correction"].
+        levels:          List of levels to generate per dimension. Any subset of:
+                         ["low", "medium", "high"].
+        db_schema:       Database schema DDL. Required for structural, interference, and
+                         schema_correction dimensions (pass empty string for lexical/value only).
+        second_anchor_json: Required for structural HIGH level.
+                         JSON: '{"question": "...", "sql": "..."}'.
+        candidate_values_json: Required for value MEDIUM/HIGH.
+                         JSON: '{"table.column": ["val1", "val2", ...]}'.
+        schema_terms_json: Optional pre-extracted schema terms for schema_correction
+                         (extracted automatically via LLM if omitted).
+
+    Returns:
+        A JSON array of NoiseVariant objects (one per dimension × level combination).
+        Failed items include an "error" key instead of variant fields.
+    """
+    _DIMS_NEEDING_SCHEMA = {"structural", "interference", "schema_correction"}
+
+    requests = []
+    for dim in dimensions:
+        for lvl in levels:
+            req: dict = {
+                "anchor_question": anchor_question,
+                "anchor_sql": anchor_sql,
+                "dimension": dim.lower(),
+                "level": lvl.lower(),
+            }
+            if dim.lower() in _DIMS_NEEDING_SCHEMA:
+                req["db_schema"] = db_schema
+            if dim.lower() == "structural" and second_anchor_json:
+                req["second_anchor_json"] = second_anchor_json
+            if dim.lower() == "value" and candidate_values_json:
+                req["candidate_values_json"] = candidate_values_json
+            if dim.lower() == "schema_correction" and schema_terms_json:
+                req["schema_terms_json"] = schema_terms_json
+            requests.append(req)
+
+    raw_results = await asyncio.gather(
+        *[_dispatch_variant(req) for req in requests],
+        return_exceptions=True,
+    )
+
+    output = []
+    for r in raw_results:
+        if isinstance(r, Exception):
+            output.append({"error": str(r)})
+        else:
+            output.append(json.loads(r))
+
+    return json.dumps(output, indent=2)
+
+
 @mcp.prompt
 def generate_bulk_templates() -> str:
     """Initiates a guided workflow to automatically generate templates based on the database schema."""
