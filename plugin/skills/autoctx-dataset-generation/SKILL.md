@@ -74,10 +74,15 @@ Generate a conceptual plan covering:
 
 ### **Phase 5: Expansion (Contextual Multiplication)**
 
-When requested to expand, you should gennerate new pairs by either of the following approach:
+When requested to expand the dataset, there are two paths depending on what the user wants:
 
-1. follow the generation plan to generate more new pairs. Focus on maintaining the structural, topical, and complexity diversity as defined in the plan. Always ensure that new pairs are grounded in the provided context and pass the "Blind" Test.
-2. read existing datasets and generate diverse variations. Focus on Scenario Shifting (e.g., financial -> operational), Constraint Layering (adding intersecting conditions), and Conversational Phrasing variations, maintaining the requested complexity distribution.
+1. **Generate additional new pairs from context** (schema, docs, query logs): Follow the generation plan from Phase 2 to produce more net-new pairs grounded in the provided business context. Continue through Phases 3 and 4 as normal. Focus on maintaining structural, topical, and complexity diversity as defined in the plan.
+
+2. **Create structural variations of existing pairs**: **Invoke the `autoctx-dataset-expansion` skill.** This skill handles all variation-based expansion strategies (paraphrasing, merging, difficulty adjustment, distraction injection, linguistic variation, and value substitution). Pass the current output file path as both the source dataset and the output file. The skill will handle batch ID continuity, SQL execution validation, and the two-tier validation report automatically.
+
+If the user asks to "expand" or "grow" the dataset without specifying which approach, ask them:
+- Do they want **new pairs generated from the original business context** (approach 1)?
+- Or do they want **variations of the pairs already in the dataset** (approach 2, via `autoctx-dataset-expansion`)?
 
 ### **Phase 6: Sampling (Budgeting & Sub-setting)**
 
